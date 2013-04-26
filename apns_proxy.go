@@ -34,7 +34,7 @@ var (
 	//APNS stuff
 	APNS_CERT = flag.String("apns:cert", "apns.cert.pem", "path to APNS certificate")
 	APNS_KEY  = flag.String("apns:key", "apns.key.pem", "path to APNS private key")
-	SBOX_CERT = flag.String("sbox:cert", "sbox.key.pem", "path to APNS Sandbox certificate")
+	SBOX_CERT = flag.String("sbox:cert", "sbox.cert.pem", "path to APNS Sandbox certificate")
 	SBOX_KEY  = flag.String("sbox:key", "sbox.key.pem", "path to APNS Sandbox key")
 )
 
