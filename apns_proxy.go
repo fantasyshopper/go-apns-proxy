@@ -7,8 +7,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	//Add some APNS lib here.
 	"github.com/Mistobaan/go-apns"
@@ -32,10 +37,15 @@ var (
 	BUFFER = flag.Int("buffer", 10000, "Max number of messages to queue before blocking")
 	LISTEN = flag.String("listen", "localhost:8765", "The port to listen for messages")
 	//APNS stuff
-	APNS_CERT = flag.String("apns:cert", "apns.cert.pem", "path to APNS certificate")
-	APNS_KEY  = flag.String("apns:key", "apns.key.pem", "path to APNS private key")
-	SBOX_CERT = flag.String("sbox:cert", "sbox.cert.pem", "path to APNS Sandbox certificate")
-	SBOX_KEY  = flag.String("sbox:key", "sbox.key.pem", "path to APNS Sandbox key")
+	APNS_CERT  = flag.String("apns:cert", "apns.cert.pem", "path to APNS certificate")
+	APNS_KEY   = flag.String("apns:key", "apns.key.pem", "path to APNS private key")
+	SBOX_CERT  = flag.String("sbox:cert", "sbox.cert.pem", "path to APNS Sandbox certificate")
+	SBOX_KEY   = flag.String("sbox:key", "sbox.key.pem", "path to APNS Sandbox key")
+	BackupPath = flag.String("backup_path", ".back_apns_proxy", "save backup file path")
+	Backup     = flag.Bool("backup", false, "send notification of backup file")
+
+	closeApnsChannel   = false
+	closeTCPConnection = false
 )
 
 //Constants
@@ -59,22 +69,107 @@ func main() {
 		log.Fatalf("Sandbox APNS Gateway fail: %s\n", err)
 	}
 
-	//For the contents of the channel created by start inbound listener
-	for msg := range startInboundListener() {
-		//Send APNS Message
-		log.Printf("Sending APNS msg: %s\n", msg)
-		if err := ProdAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
-			log.Printf("ERROR on Main Gateway: %s\n", err)
-			if err := SandBoxAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
-				log.Printf("ERROR on Sandbox Gateway: %s\n", err)
+	// Do backup
+	if *Backup {
+		b, err := loadBackup()
+		if err != nil {
+			log.Fatal(err)
+		}
+		var apns []ApnsMessage
+		err = json.Unmarshal(b, &apns)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, msg := range apns {
+			log.Printf("Sending APNS msg: %s\n", msg)
+			if err := ProdAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
+				log.Printf("ERROR on Main Gateway: %s\n", err)
+				if err := SandBoxAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
+					log.Printf("ERROR on Sandbox Gateway: %s\n", err)
+				} else {
+					log.Printf("SENT Sandbox Gateway: %s\n", msg.DeviceId)
+				}
 			} else {
-				log.Printf("SENT Sandbox Gateway: %s\n", msg.DeviceId)
+				log.Printf("SENT Main Gateway: %s\n", msg.DeviceId)
 			}
-		} else {
-			log.Printf("SENT Main Gateway: %s\n", msg.DeviceId)
+		}
+		os.Rename(*BackupPath, fmt.Sprintf("%s.%s", *BackupPath, time.Now().Format("20060102150405")))
+		return
+	}
+
+	// detect signal of interrupt, kill
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, syscall.SIGTERM, os.Interrupt, os.Kill)
+
+	apnsMessage := startInboundListener()
+
+	for {
+		select {
+		case msg := <-apnsMessage:
+			log.Printf("Sending APNS msg: %s\n", msg)
+			if err := ProdAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
+				log.Printf("ERROR on Main Gateway: %s\n", err)
+				if err := SandBoxAPNS.SendPayloadString(msg.DeviceId, []byte(msg.Payload), time.Duration(msg.Lifetime)*time.Second); err != nil {
+					log.Printf("ERROR on Sandbox Gateway: %s\n", err)
+				} else {
+					log.Printf("SENT Sandbox Gateway: %s\n", msg.DeviceId)
+				}
+			} else {
+				log.Printf("SENT Main Gateway: %s\n", msg.DeviceId)
+			}
+		case <-done:
+			log.Println("detect signal. start cleanup...")
+			f, err := os.Create(*BackupPath)
+			if err != nil {
+				log.Fatal(err)
+			}
+			cleanup(apnsMessage, f)
+			log.Println("done cleanup! please input '-backup flag' on next time")
+			os.Exit(0)
 		}
 	}
-	//done
+}
+
+func loadBackup() (b []byte, err error) {
+	b, err = ioutil.ReadFile(*BackupPath)
+	return
+}
+
+func cleanup(mch chan *ApnsMessage, out io.Writer) (n int, err error) {
+	closeTCPConnection = true
+
+	// timeout apnsMessage
+	go func() {
+		time.Sleep(time.Second * 30)
+		closeApnsChannel = true
+		close(mch)
+	}()
+
+	var bufferMsg []ApnsMessage
+
+	for {
+		m, ok := <-mch
+		if !ok || m == nil {
+			break
+		}
+		bufferMsg = append(bufferMsg, *m)
+	}
+
+	if len(bufferMsg) == 0 {
+		return
+	}
+
+	b, err := json.Marshal(bufferMsg)
+	if err != nil {
+		return
+	}
+	n, err = out.Write(b)
+	if err != nil {
+		return
+	}
+
+	return
 }
 
 //This returns a channel new messages come in on.
@@ -90,7 +185,13 @@ func startInboundListener() chan *ApnsMessage {
 	log.Printf("Listening on %s\n", *LISTEN)
 	//start a go routine that accepts connections.
 	go func() {
-		for { //in an infinite loop
+		for {
+			defer ln.Close()
+			if closeTCPConnection {
+				return
+			}
+
+			//in an infinite loop
 			conn, err := ln.Accept() //accept new conenctions
 			if err != nil {
 				log.Printf("ERROR: %s\n", err)
@@ -107,7 +208,9 @@ func startInboundListener() chan *ApnsMessage {
 						return
 					}
 					log.Printf("Received msg: %s\n", out)
-					ch <- out //send message back on channel
+					if !closeApnsChannel {
+						ch <- out //send message back on channel
+					}
 				}
 			}(conn) //pass in the current connection handle
 		}
